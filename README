@@ -1,5 +1,10 @@
 Redis Tools
+==================
+
 
 
 Redis Summary
-====================
+-------------------------
+
+# Generate a summary of all keys and values stored in db 5, using a sample size of 100 random keys
+redis-summary -n 5 -s 100

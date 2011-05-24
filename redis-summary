@@ -2,10 +2,36 @@
 
 require 'rubygems'
 require 'redis'
+require 'ostruct'
+require 'optparse'
 
 
-HOST="192.168.167.60"
-SAMPLE_SIZE = 10000
+DEFAULTS = {
+  :sample_size => 10_000,
+  :host => IO.popen("ifconfig | grep -o -P \"(192|127)\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\" | head -n 1").read.strip
+}
+
+$defaults = DEFAULTS
+$options  = {}
+
+OptionParser.new do |opts|
+  opts.on("-h", "--host HOST", "IP of redis host") do |host|
+    $options[:host] = host
+  end
+  opts.on("-s", "--sample-size N", "number of sample keys to use for analysis (default is #{$defaults[:sample_size]})") do |sample_size|
+    $options[:sample_size] = sample_size.to_i
+  end
+  opts.on("-n", "--database N", "number of database to analyze (default will analyze all)") do |db_num|
+    $options[:db_num] = db_num.to_i
+  end
+  opts.on("-t", "--totals-only", "only show totals for key-value inventory") do |totals_only|
+    $options[:totals_only] = totals_only
+  end
+end.parse!
+
+
+$settings = OpenStruct.new $defaults.merge($options)
+
 
 class Array
 
@@ -17,76 +43,145 @@ end
 
 class RedisStats
 
-  @@default_sample_size = SAMPLE_SIZE
-  @@info = `redis-cli -h #{HOST} info`
+  @@host = $settings.host
+  @@default_sample_size = $settings.sample_size
+  @@info = `redis-cli -h \"#{$settings.host}\" info`
 
-  attr_accessor :db, :sample_size, :keys, :cross_section, :info, :db_size, :multiplier
+  attr_accessor :db, :db_name, :sample_size, :keys, :cross_section, :info, :db_size, :multiplier
+  @@log_file = "#{ENV['HOME']}/redis-summary.log"
 
   def self.info
-    @@info
-  end
+     @@info
+   end
 
-  def self.dbs
-    @@info.scan(/^db/)
-  end
+   def self.log(message)
+     puts message
+     #`echo #{message} >> #{@@log_file}`
+   end
 
-  def initialize(db_name, options = {})
-    options[:sample_size] ||= @@default_sample_size
-    db = Redis.new(:host => HOST, :db => db_name)
-    @sample_keys   = Array.new(options[:sample_size]).map{|i| db.randomkey }
-    @cross_section = @sample_keys.map{|i| i.gsub(/\d+/,"*").gsub(/\*[^:]+/,'*').gsub(/\*{2,}/,'*').gsub("*",".*")  }.uniq
-    @multiplier = db.dbsize.to_f / options[:sample_size].to_f
-    @info = @cross_section.
-      map do |pattern|
-        keys     = @sample_keys.select{|k| k =~ Regexp.new(pattern)  }
-        value_charsize = keys.map{|k| redis_size(db, k) }.sum
-        key_charsize   = keys.map{|k| k.length }.sum
-        begin
-          {
-            :key_pattern => pattern,
-            :charsize_of_all_matching_values =>  value_charsize,
-            :charsize_of_all_matching_keys   =>  key_charsize,
-            :charsize_of_all_matching_keys_and_values   =>   (value_charsize + key_charsize),
-            :key_match_count => keys.size,
-            :avg_key_charsize => key_charsize.to_f / keys.size.to_f,
-            :avg_value_charsize => value_charsize.to_f / keys.size.to_f,
-            :avg_total_size => (value_charsize.to_f/keys.size.to_f) + (key_charsize.to_f/ keys.size.to_f) ,
-            :estimated_total_key_and_value_charsize => (value_charsize + key_charsize) * @multiplier
-          }
-        rescue => e
-          puts "skipping - #{e.inspect}"
-          next
-        end
-      end.
-      sort{|a,b| b[:estimated_total_key_and_value_charsize] <=> a[:estimated_total_key_and_value_charsize] }
-  end
+   def self.dbs
+     $settings.db_num.nil? ? info.scan(/^db(\d+)/).map{|match| match.first.strip} : [$settings.db_num]
+   end
 
-  def redis_size(db, k)
-    t = db.type(k)
-    case t
-      when 'string' then db.get(k).length
-      when 'list'   then db.lrange(k, 0, -1).size
-      when 'zset'   then db.zrange(k, 0, -1).size
-      when 'set'    then db.smembers(k).size
-      else raise("Redis type '#{t}' not yet supported.")  # TODO accommodate more types
-    end
-  end
+   def self.actual_mem
+     info.scan(/used_memory\:\d+/).first.strip.split(":")[-1].to_i rescue "can't be read"
+   end
 
-  def display
-    line_width = 70
-    left_justification = 13
-    info.each do |i|
-      puts "\n"
-      puts "=" * line_width
-      puts "Key Pattern: #{i.delete(:key)}"
-      puts "-" * line_width
-      i.to_a.sort{|b,a| a[0].to_s <=> b[0].to_s} do |p|
-        puts [p[0].to_s.ljust(left_justification),p[1]].join(" ")
-      end
-    end
-  end
+   def self.for_all
+     @for_all ||= dbs.map{|db| self.new(db) }
+   end
+
+   def self.total_size
+     for_all.map(&:estimated_db_size).sum
+   end
+
+   def initialize(db_name, options = {})
+     self.class.log("Collecting stats for #{db_name}")
+     @db_name = db_name
+     @db = Redis.new(:host => @@host, :db => @db_name)
+     @db_size = @db.dbsize
+
+     options[:sample_size] ||= @@default_sample_size
+     options[:sample_size] = @db_size if options[:sample_size] > @db_size
+     options[:host] ||= @@host
+
+     @sample_size = options[:sample_size]
+     self.class.log("Collecting random keys")
+     @sample_keys   = Array.new(@sample_size).map{|i| @db.randomkey }
+     self.class.log("Patternizing #{@sample_keys.size} keys")
+     @cross_section = @sample_keys.map{|i| i.gsub(/\d+/,"*").gsub(/\*[^:]+/,'*').gsub(/\*{2,}/,'*').gsub("*",".*")  }.uniq
+     @multiplier = @db.dbsize.to_f / @sample_size.to_f
+     @info = @cross_section.
+       map do |pattern|
+         self.class.log("Examining pattern #{pattern.inspect}")
+         keys     = @sample_keys.select{|k| k =~ Regexp.new(pattern)  }
+         value_charsize = keys.map{|k| redis_size(@db, k) }.sum
+         key_charsize   = keys.map{|k| k.length }.sum
+         sample_key     = keys.last
+         sample_value   = ( @db.get(sample_key).dump ) rescue "ERROR / VALUE NOT RECOVERED"
+         begin
+           {
+             :db_size_to_sample_size_ratio => @multiplier,
+             :key_pattern => pattern,
+             :charsize_of_all_matching_values =>  value_charsize,
+             :charsize_of_all_matching_keys   =>  key_charsize,
+             :charsize_of_all_matching_keys_and_values   =>   (value_charsize + key_charsize),
+             :key_match_count => keys.size,
+             :key_count_estimated_total => (keys.size * @multiplier),
+             :avg_value_charsize => value_charsize.to_f / keys.size.to_f,
+             :avg_key_charsize   => key_charsize.to_f / keys.size.to_f,
+             :avg_total_charsize => (value_charsize + key_charsize) / keys.size.to_f,
+             :estimated_total_key_and_value_charsize => (value_charsize + key_charsize) * @multiplier,
+             :sample_key => sample_key,
+             :sample_value => sample_value
+           }
+         rescue => e
+           puts "skipping - #{e.inspect}"
+           next
+         end
+       end.
+       sort{|a,b| b[:estimated_total_key_and_value_charsize] <=> a[:estimated_total_key_and_value_charsize] }
+   end
+
+   def estimated_db_size
+     @estimated_size ||= info.map{|i| i[:estimated_total_key_and_value_charsize]}.sum
+   end
+
+   def redis_size(db, k)
+     t = db.type(k)
+     case t
+       when 'string' then db.get(k).length
+       when 'list'   then db.lrange(k, 0, -1).size
+       when 'zset'   then db.zrange(k, 0, -1).size
+       when 'set'    then db.smembers(k).size
+       when 'hash'   then 0
+       else raise("Redis type '#{t}' not yet supported.")  # TODO accommodate more types
+     end
+   end
+
+   def display
+     section_break_char = "*"
+     major_line_char = "="
+     minor_line_char = "-"
+     line_width = 70
+     left_justification = info.first.keys.map(&:to_s).map(&:size).max + 5
+     puts "\n\n\n"
+     2.times{ puts section_break_char * line_width }
+     puts "\nRedis Info for database: #{db_name} (sample size #{sample_size})\n\n"
+     2.times{ puts section_break_char * line_width  }
+     info.each do |i|
+       puts "\n"
+       puts major_line_char * line_width
+       puts "Key Pattern: #{i.delete(:key_pattern)}"
+       puts minor_line_char * line_width
+       i.to_a.sort{|a,b| a[0].to_s <=> b[0].to_s}.each do |p|
+         puts [p[0].to_s.ljust(left_justification),p[1]].join(" ")
+       end
+     end
+     puts "\n\n"
+     puts minor_line_char * line_width
+     puts "\nEstimated Total DB Size: #{estimated_db_size}"
+   end
 
 end
 
-puts RedisStats.dbs.inspect
-RedisStats.new(ARGV[0], :sample_size => SAMPLE_SIZE ).display
+puts "Using host #{$settings.host}"
+
+all_stats = RedisStats.for_all
+all_stats.each(&:display) unless $settings.totals_only
+
+if $settings.db_num.nil?
+ unless $settings.totals_only
+   puts "\n\n\n"
+   puts "OVERALL SIZE STATS"
+   puts "************************************"
+ end
+ all_stats.each do |db|
+   puts "DB #{db.db_name} size (chars): #{db.estimated_db_size}"
+ end
+ puts "\nTotal chars: #{RedisStats.total_size }"
+ puts "Redis Reported Mem Usage: #{RedisStats.actual_mem}"
+ puts "Reported Mem / Computed total char: #{RedisStats.actual_mem.to_f / RedisStats.total_size.to_f}"
+else
+ puts "Redis Reported Mem Usage: #{RedisStats.actual_mem}"
+end
