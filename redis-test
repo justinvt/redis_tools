@@ -1,0 +1,219 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+require 'redis'
+
+TEST_DB = 7
+HOST = `ifconfig | grep -o -m 1 -P "(192|127)(\.[0-9]{1,3}){3}"`.strip
+
+class String
+
+  def truncate(max_size)
+    if self.size > max_size
+      self[0..max_size.pred] + "...(#{self.size} characters)..." + self[-3..-1]
+    else
+      self
+    end
+  end
+
+end
+
+class Hash
+
+  def truncate(max_size)
+    char_size = self.to_a.flatten.join.size
+    if char_size > max_size
+      self.inspect[0..max_size.pred] + "...(#{char_size} characters)..." + self.inspect[-3..-1]
+    else
+      self.inspect
+    end
+  end
+
+end
+
+class RedisTest
+
+  R = Redis.new(:host => HOST, :db => TEST_DB)
+  CHARS = ("a".."z").to_a + ("A".."Z").to_a + ("0".."9").to_a
+
+  attr_accessor :size, :key_generator, :value_generator, :hash, :value_size, :key_size, :field_size, :fields, :options
+
+  def initialize(options={})
+    @options = options
+    @options[:values] ||= {}
+    @options[:fields] ||= {}
+    @options[:keys]   ||= {}
+    @size       = options[:size] || 1000
+    @hash       = options[:values][:type] == :hash
+    @flattened_hash = !@hash && @options[:keys][:simulate_fields]
+    @value_size = options[:values][:size] || 100
+    @key_size   = options[:keys][:size]   || 10
+    @field_size = options[:fields][:size] || 100
+    @fields     = options[:fields][:count] || 1
+  end
+
+  def run
+    R.flushall unless @options[:no_flush]
+    @size.times do |i|
+      @options[:keys][:seed] = i
+      if @hash
+        key = key_generator(@options[:keys])
+        @fields.times do |j|
+          @options[:fields][:seed] = j
+          field = field_generator(@options[:fields])
+          val = value_generator(@options[:values])
+          R.hset key, field, val
+        end
+      else
+        @fields.times do |j|
+          @options[:fields][:seed] = j
+          key = @flattened_hash ?
+              [key_generator(@options[:keys]),field_generator(@options[:fields])].join :
+              key_generator(@options[:keys])
+          val = value_generator(@options[:values])
+          R.set key, val
+        end
+      end
+    end
+    report
+  end
+
+  def key_generator(options={})
+    if options[:random]
+     value_generator(options)
+    else
+      "key:#{options[:seed]}"
+    end
+  end
+
+  def value_generator(options={})
+    if options[:random]
+      string(options)
+    else
+      options[:size] == 0 ? "" : CHARS[0..options[:size].to_i.pred].join
+    end
+  end
+
+  def field_generator(options={})
+   if options[:random]
+     string(options)
+   else
+     "field:#{options[:seed]}"
+   end
+  end
+
+  def pairsize(k)
+    R.type(k) == "hash" ?  (k.size + R.hgetall(k).to_a.flatten.join.size) : (k.size + R.strlen(k))
+  end
+
+  def total_char_size
+    keys = R.keys
+    size = 0
+    keys.each do |k|
+      size += pairsize(k)
+    end
+    size
+  end
+
+  def field_count
+    R.hlen random_key
+  end
+
+  def count
+    R.dbsize
+  end
+
+  def random_key
+    R.randomkey
+  end
+
+  def random_field_value
+     R.hgetall(random_key).to_a[0][0]
+  end
+
+  def random_hash_value
+     R.hgetall(random_key).to_a[0][1]
+  end
+
+  def random_value
+    key = random_key
+    R.type(key) == "hash" ? R.hgetall(key) : R.get(key)
+  end
+
+  def report
+    randkey = random_key
+    puts [
+      R.dbsize,
+      self.total_char_size,
+      self.class.memory,
+      self.overhead,
+      randkey.to_s.truncate(30),
+      random_value.to_s.truncate(50)
+    ].join("\t")
+  end
+
+  def string(options = {})
+    options[:size] ||= 10
+    Array.new( options[:randomize_length] ? rand( options[:size] ) :  options[:size] ).map{ CHARS[rand(CHARS.size)] }.join
+  end
+
+  def self.info
+    status = {}
+    `redis-cli -n #{TEST_DB} -h \"#{HOST}\" info`.strip.split(/\n|\r/).map{|v| v.split(":") }.each do |kv|
+      status[kv[0].to_sym] = kv[1] unless kv[0].nil?
+    end
+    status
+  end
+
+  def self.memory
+    self.info[:used_memory]
+  end
+
+  def overhead
+    self.class.memory.to_f / total_char_size
+  end
+
+  def type
+    @hash ? "Hash" : (@flattened_hash ? "Flattened Hash" : "String")
+  end
+
+  def description
+    output = "#{@size} #{type} records, key length = #{@key_size}, value length = #{@value_size}"
+    output << ", field count = #{@fields}, field length = #{@field_size}" if @hash || @flattened_hash
+    output
+  end
+
+end
+
+
+@strings = RedisTest.new(
+  :size   => 10000,
+  :keys   => { :size => 10, :random => true},
+  :values => { :size => 10, :random => true}
+)
+
+@hashes = RedisTest.new(
+  :size   => 10000,
+  :keys   => { :size => 10, :random => true},
+  :values => { :size => 10, :random => true, :type => :hash},
+  :fields => { :size => 10, :count => 5, :random => true}
+)
+
+@flattened_hashes = RedisTest.new(
+  :size   => 10000,
+  :keys   => { :size => 10, :random => true, :simulate_fields => true},
+  :values => { :size => 10, :random => true},
+  :fields => { :size => 10, :count => 5, :random => true}
+)
+
+
+puts @strings.description
+@strings.run
+
+puts @hashes.description
+@hashes.run
+
+puts @flattened_hashes.description
+@flattened_hashes.run
+
+
