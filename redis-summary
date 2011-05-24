@@ -1,0 +1,92 @@
+#!/usr/bin/env ruby
+
+require 'rubygems'
+require 'redis'
+
+
+HOST="192.168.167.60"
+SAMPLE_SIZE = 10000
+
+class Array
+
+  def sum
+    self.inject(0){ |sum, e| sum + e }
+  end
+
+end
+
+class RedisStats
+
+  @@default_sample_size = SAMPLE_SIZE
+  @@info = `redis-cli -h #{HOST} info`
+
+  attr_accessor :db, :sample_size, :keys, :cross_section, :info, :db_size, :multiplier
+
+  def self.info
+    @@info
+  end
+
+  def self.dbs
+    @@info.scan(/^db/)
+  end
+
+  def initialize(db_name, options = {})
+    options[:sample_size] ||= @@default_sample_size
+    db = Redis.new(:host => HOST, :db => db_name)
+    @sample_keys   = Array.new(options[:sample_size]).map{|i| db.randomkey }
+    @cross_section = @sample_keys.map{|i| i.gsub(/\d+/,"*").gsub(/\*[^:]+/,'*').gsub(/\*{2,}/,'*').gsub("*",".*")  }.uniq
+    @multiplier = db.dbsize.to_f / options[:sample_size].to_f
+    @info = @cross_section.
+      map do |pattern|
+        keys     = @sample_keys.select{|k| k =~ Regexp.new(pattern)  }
+        value_charsize = keys.map{|k| redis_size(db, k) }.sum
+        key_charsize   = keys.map{|k| k.length }.sum
+        begin
+          {
+            :key_pattern => pattern,
+            :charsize_of_all_matching_values =>  value_charsize,
+            :charsize_of_all_matching_keys   =>  key_charsize,
+            :charsize_of_all_matching_keys_and_values   =>   (value_charsize + key_charsize),
+            :key_match_count => keys.size,
+            :avg_key_charsize => key_charsize.to_f / keys.size.to_f,
+            :avg_value_charsize => value_charsize.to_f / keys.size.to_f,
+            :avg_total_size => (value_charsize.to_f/keys.size.to_f) + (key_charsize.to_f/ keys.size.to_f) ,
+            :estimated_total_key_and_value_charsize => (value_charsize + key_charsize) * @multiplier
+          }
+        rescue => e
+          puts "skipping - #{e.inspect}"
+          next
+        end
+      end.
+      sort{|a,b| b[:estimated_total_key_and_value_charsize] <=> a[:estimated_total_key_and_value_charsize] }
+  end
+
+  def redis_size(db, k)
+    t = db.type(k)
+    case t
+      when 'string' then db.get(k).length
+      when 'list'   then db.lrange(k, 0, -1).size
+      when 'zset'   then db.zrange(k, 0, -1).size
+      when 'set'    then db.smembers(k).size
+      else raise("Redis type '#{t}' not yet supported.")  # TODO accommodate more types
+    end
+  end
+
+  def display
+    line_width = 70
+    left_justification = 13
+    info.each do |i|
+      puts "\n"
+      puts "=" * line_width
+      puts "Key Pattern: #{i.delete(:key)}"
+      puts "-" * line_width
+      i.to_a.sort{|b,a| a[0].to_s <=> b[0].to_s} do |p|
+        puts [p[0].to_s.ljust(left_justification),p[1]].join(" ")
+      end
+    end
+  end
+
+end
+
+puts RedisStats.dbs.inspect
+RedisStats.new(ARGV[0], :sample_size => SAMPLE_SIZE ).display
