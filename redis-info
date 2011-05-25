@@ -1,0 +1,4 @@
+#!/bin/sh
+
+
+/usr/local/bin/redis-cli -h $(/usr/local/bin/redis-host) info

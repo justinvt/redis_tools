@@ -1,0 +1,7 @@
+#!/bin/sh
+
+mem=`/usr/local/bin/redis-stat used_memory`
+rss=`/usr/local/bin/redis-stat used_memory_rss`
+frag=`/usr/local/bin/redis-stat mem_fragmentation_ratio`
+
+echo "$(/bin/date)\t$mem\t$rss\t$frag"

@@ -1,0 +1,75 @@
+#!/usr/bin/env ruby
+
+
+require 'rubygems'
+require 'redis'
+
+PATTERN='user*CheckinPost:share'
+
+
+HOST='192.168.167.60'
+DB='3'
+
+db = Redis.new(:host => HOST, :db => DB)
+
+puts "Collecting keys that match #{PATTERN} - this will take a minute"
+keys = db.keys(PATTERN)
+
+
+puts "\nYou will be deleting keys that look like this..."
+sample_keys = (keys[0..10].compact + keys[-9..-1].compact).uniq
+puts sample_keys.inspect + "\n\n"
+puts "\nThe patterns they follow are (this will take a minute - we're examining all #{keys.size} keys to be safe..."
+$counter=0
+patternized = keys.map do |k| 
+        $counter += 1
+        #print "." if $counter % 50 == 0
+        puts "#{($counter.to_f / keys.size.to_f) * 100} %" if $counter % 100000 == 0
+        k.gsub(/\d+/,'*')
+end.uniq
+
+puts "\n\nHere are the anonymized patterns we discovered within the set of keys to be deleted."
+puts "\n\n"
+puts patternized.inspect
+puts "\n\n"
+puts "IMPORTANT: There should only be 1 or a few of these, otherwise we highly recommend double-checking your pattern."
+print "Do they look ok? (Y/n)"
+@accept = gets
+
+if @accept.strip == "Y"
+  @inc = 0
+  @group_size=100
+  times = keys.size / @group_size
+  (times + 1).times do |k|
+    check = keys[@inc..(@inc+@group_size)]
+    @inc += @group_size
+    print "Is it ok to delete these? \n\n#{check.inspect} \n\n(Y/n/A)"
+    @ok = gets
+    if @ok.strip == "A"
+      break
+    elsif @ok.strip == "Y"
+      check.each{|k| db.del(k) }
+    end
+  end
+end
+
+
+total = keys.size
+if @ok.strip == "A"
+#db.multi do
+
+#  if @ok.strip == "A"
+    keys.each_with_index do |k,i|
+      puts "#{100 * (i.to_f / total.to_f)} %" if i % 500 == 0
+      #id = "#{k} -> #{db.get(k)}"
+      #puts id
+      #system("echo '#{id}' > deleted_keys.txt")
+      db.del(k)
+ #   end
+   end
+#end
+end
+
+leftover = db.keys(PATTERN)
+puts "\n\nYou're complete.  There are #{leftover.size} keys left matching the pattern #{PATTERN}"
+

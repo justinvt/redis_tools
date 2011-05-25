@@ -1,0 +1,3 @@
+#!/bin/sh
+
+/usr/local/bin/redis-info | /bin/grep -P "$1:" | /bin/grep -o -P "(?<=\:).*$" | /usr/bin/tr -d '\r'
