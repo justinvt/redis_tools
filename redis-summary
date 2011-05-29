@@ -134,7 +134,7 @@ class RedisStats
        when 'list'   then db.lrange(k, 0, -1).size
        when 'zset'   then db.zrange(k, 0, -1).size
        when 'set'    then db.smembers(k).size
-       when 'hash'   then 0
+       when 'hash'   then db.hgetall(k).to_a.flatten.join.size
        else raise("Redis type '#{t}' not yet supported.")  # TODO accommodate more types
      end
    end
