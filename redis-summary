@@ -94,12 +94,12 @@ class RedisStats
      @info = @cross_section.
        map do |pattern|
          self.class.log("Examining pattern #{pattern.inspect}")
-         keys     = @sample_keys.select{|k| k =~ Regexp.new(pattern)  }
-         value_charsize = keys.map{|k| redis_size(@db, k) }.sum
-         key_charsize   = keys.map{|k| k.length }.sum
-         sample_key     = keys.last
-         sample_value   = ( @db.get(sample_key).dump ) rescue "ERROR / VALUE NOT RECOVERED"
          begin
+           keys     = @sample_keys.select{|k| k =~ Regexp.new(pattern)  }
+           value_charsize = keys.map{|k| redis_size(@db, k) }.sum
+           key_charsize   = keys.map{|k| k.length }.sum
+           sample_key     = keys.last
+           sample_value   = ( @db.get(sample_key).dump ) rescue "ERROR / VALUE NOT RECOVERED"
            {
              :db_size_to_sample_size_ratio => @multiplier,
              :key_pattern => pattern,
@@ -120,11 +120,11 @@ class RedisStats
            next
          end
        end.
-       sort{|a,b| b[:estimated_total_key_and_value_charsize] <=> a[:estimated_total_key_and_value_charsize] }
+       sort{|a,b| b && a ? b[:estimated_total_key_and_value_charsize] <=> a[:estimated_total_key_and_value_charsize] : 0}
    end
 
    def estimated_db_size
-     @estimated_size ||= info.map{|i| i[:estimated_total_key_and_value_charsize]}.sum
+     @estimated_size ||= info.map{|i| i ? i[:estimated_total_key_and_value_charsize] : 0}.sum
    end
 
    def redis_size(db, k)
@@ -144,7 +144,7 @@ class RedisStats
      major_line_char = "="
      minor_line_char = "-"
      line_width = 70
-     left_justification = info.first.keys.map(&:to_s).map(&:size).max + 5
+     left_justification = info.first ? info.first.keys.map(&:to_s).map(&:size).max + 5 : 0
      puts "\n\n\n"
      2.times{ puts section_break_char * line_width }
      puts "\nRedis Info for database: #{db_name} (sample size #{sample_size})\n\n"
@@ -152,7 +152,7 @@ class RedisStats
      info.each do |i|
        puts "\n"
        puts major_line_char * line_width
-       puts "Key Pattern: #{i.delete(:key_pattern)}"
+       puts "Key Pattern: #{i.delete(:key_pattern)}" if i
        puts minor_line_char * line_width
        i.to_a.sort{|a,b| a[0].to_s <=> b[0].to_s}.each do |p|
          puts [p[0].to_s.ljust(left_justification),p[1]].join(" ")
